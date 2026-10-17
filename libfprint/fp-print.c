@@ -629,6 +629,24 @@ fp_print_equal (FpPrint *self, FpPrint *other)
 
       return TRUE;
 
+    case FPI_PRINT_SIGFM:
+      if (self->prints->len != other->prints->len)
+        return FALSE;
+
+      for (guint i = 0; i < self->prints->len; i++)
+        {
+          g_autofree unsigned char *a = NULL;
+          g_autofree unsigned char *b = NULL;
+          int a_len, b_len;
+
+          a = sigfm_serialize_binary (g_ptr_array_index (self->prints, i), &a_len);
+          b = sigfm_serialize_binary (g_ptr_array_index (other->prints, i), &b_len);
+          if (!a || !b || a_len != b_len || memcmp (a, b, a_len) != 0)
+            return FALSE;
+        }
+
+      return TRUE;
+
     case FPI_PRINT_UNDEFINED:
       g_assert_not_reached ();
     }
