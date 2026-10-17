@@ -32,6 +32,28 @@
 #define ELAN_0C03 (1 << 1)
 #define ELAN_0C42 (1 << 2)
 #define ELAN_0C58 (1 << 3)
+#define ELAN_0903 (1 << 4)
+
+/* devices which are area (press/touch) sensors rather than swipe sensors.
+ * The whole fingertip area is captured in one frame, so no frame assembling
+ * is done: we wait for the finger to settle and use a single full frame. */
+#define ELAN_PRESS_DEV ELAN_0903
+#define ELAN_IS_PRESS(dev_type) (((dev_type) & ELAN_PRESS_DEV) != 0)
+
+/* press sensors: number of frames to read after the finger is detected, the
+ * last one is used. The finger pressure settles after ~250ms */
+#define ELAN_PRESS_FRAMES 10
+/* press sensors: minimum frames if the finger is lifted early */
+#define ELAN_PRESS_MIN_FRAMES 4
+/* press sensors: mean (frame - background) value above which a finger is
+ * considered present; used to wait for the finger to be lifted */
+#define ELAN_PRESS_FINGER_DELTA 600
+/* press sensors: poll interval and max time to wait for the finger to lift */
+#define ELAN_PRESS_FINGER_OFF_POLL 40
+#define ELAN_PRESS_FINGER_OFF_MAX_POLLS 750
+/* press sensors: the sensor area is tiny (~4x4mm), so record many partial
+ * prints of the fingertip during enrollment, like the Windows driver does */
+#define ELAN_PRESS_ENROLL_STAGES 15
 
 /* devices which don't require frame rotation before assembling */
 #define ELAN_NOT_ROTATED ELAN_0C03
@@ -163,7 +185,7 @@ static const struct elan_cmd stop_cmd = {
 };
 
 static const FpIdEntry elan_id_table[] = {
-  {.vid = ELAN_VEND_ID,  .pid = 0x0903, .driver_data = ELAN_ALL_DEV},
+  {.vid = ELAN_VEND_ID,  .pid = 0x0903, .driver_data = ELAN_0903},
   {.vid = ELAN_VEND_ID,  .pid = 0x0907, .driver_data = ELAN_0907},
   {.vid = ELAN_VEND_ID,  .pid = 0x0c01, .driver_data = ELAN_ALL_DEV},
   {.vid = ELAN_VEND_ID,  .pid = 0x0c02, .driver_data = ELAN_ALL_DEV},

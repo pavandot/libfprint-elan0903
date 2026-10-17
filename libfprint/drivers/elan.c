@@ -74,7 +74,7 @@ G_DEFINE_TYPE (FpiDeviceElan, fpi_device_elan, FP_TYPE_IMAGE_DEVICE);
 static int
 cmp_short (const void *a, const void *b)
 {
-  return (int) (*(short *) a - *(short *) b);
+  return (int) (*(unsigned short *) a) - (int) (*(unsigned short *) b);
 }
 
 static void
@@ -322,6 +322,43 @@ elan_submit_image (FpImageDevice *dev)
   fpi_image_device_image_captured (dev, img);
 }
 
+/* press sensors: the whole fingertip area is in one frame, so instead of
+ * assembling frames use the last (most settled) frame. Background is already
+ * subtracted, map the 1st..99th percentile linearly to 0..255. */
+static void
+elan_submit_press_image (FpImageDevice *dev)
+{
+  FpiDeviceElan *self = FPI_DEVICE_ELAN (dev);
+  unsigned int frame_size = self->frame_width * self->frame_height;
+  unsigned short *frame = self->frames->data;
+  g_autofree unsigned short *sorted = g_memdup2 (frame, frame_size * sizeof (short));
+  FpImage *img;
+  unsigned short lo, hi;
+
+  G_DEBUG_HERE ();
+
+  qsort (sorted, frame_size, sizeof (short), cmp_short);
+  lo = sorted[frame_size / 100];
+  hi = sorted[frame_size - 1 - frame_size / 100];
+  if (hi <= lo)
+    hi = lo + 1;
+
+  img = fp_image_new (self->frame_width, self->frame_height);
+  for (unsigned int i = 0; i < frame_size; i++)
+    {
+      int px = frame[i];
+
+      px = CLAMP (px, lo, hi);
+      img->data[i] = (px - lo) * 255 / (hi - lo);
+    }
+
+  fp_dbg ("press image from frame %d, levels %d..%d", self->num_frames, lo, hi);
+
+  /* native resolution, sigfm works on the ~500dpi 80x80 image as is */
+  img->flags |= FPI_IMAGE_PARTIAL;
+  fpi_image_device_image_captured (dev, img);
+}
+
 static void
 elan_cmd_done (FpiSsm *ssm)
 {
@@ -507,6 +544,91 @@ elan_stop_capture (FpiDeviceElan *self)
   fpi_ssm_start (ssm, stop_capture_complete);
 }
 
+/* press sensors: poll images until the finger is lifted. Otherwise the next
+ * calibration (done before every scan) would capture the finger as the
+ * background, and calibration fails or images are garbage. */
+enum wait_off_states {
+  WAIT_OFF_STOP,
+  WAIT_OFF_GET_IMAGE,
+  WAIT_OFF_CHECK,
+  WAIT_OFF_NUM_STATES,
+};
+
+static gboolean
+elan_press_finger_present (FpiDeviceElan *self)
+{
+  unsigned int frame_size = self->frame_width * self->frame_height;
+  g_autofree unsigned short *frame = g_malloc (frame_size * sizeof (short));
+  guint64 sum = 0;
+
+  if (!self->background || !self->last_read)
+    return FALSE;
+
+  elan_save_frame (self, frame);
+  for (unsigned int i = 0; i < frame_size; i++)
+    if (frame[i] > self->background[i])
+      sum += frame[i] - self->background[i];
+
+  fp_dbg ("finger off check: mean delta %u", (unsigned int) (sum / frame_size));
+  return sum / frame_size > ELAN_PRESS_FINGER_DELTA;
+}
+
+static void
+wait_off_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceElan *self = FPI_DEVICE_ELAN (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case WAIT_OFF_STOP:
+      self->num_frames = 0;
+      elan_run_cmd (ssm, dev, &stop_cmd, ELAN_CMD_TIMEOUT);
+      break;
+
+    case WAIT_OFF_GET_IMAGE:
+      if (self->deactivating)
+        fpi_ssm_mark_completed (ssm);
+      else
+        elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
+      break;
+
+    case WAIT_OFF_CHECK:
+      if (!self->deactivating && elan_press_finger_present (self) &&
+          ++self->num_frames < ELAN_PRESS_FINGER_OFF_MAX_POLLS)
+        fpi_ssm_jump_to_state_delayed (ssm, WAIT_OFF_GET_IMAGE,
+                                       ELAN_PRESS_FINGER_OFF_POLL);
+      else
+        fpi_ssm_mark_completed (ssm);
+      break;
+    }
+}
+
+static void
+wait_off_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceElan *self = FPI_DEVICE_ELAN (dev);
+
+  G_DEBUG_HERE ();
+
+  if (error && !g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    fp_warn ("error while waiting for finger removal: %s", error->message);
+  g_clear_error (&error);
+
+  elan_dev_reset_state (self);
+  /* the LED was already turned off by stop_cmd */
+  stop_capture_complete (ssm, dev, NULL);
+}
+
+static void
+elan_wait_finger_off (FpiDeviceElan *self)
+{
+  G_DEBUG_HERE ();
+
+  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (self), wait_off_run_state,
+                              WAIT_OFF_NUM_STATES),
+                 wait_off_complete);
+}
+
 enum capture_states {
   CAPTURE_LED_ON,
   CAPTURE_WAIT_FINGER,
@@ -563,7 +685,8 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
         {
           fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
         }
-      else if (self->num_frames < ELAN_MAX_FRAMES)
+      else if (self->num_frames < (ELAN_IS_PRESS (self->dev_type) ?
+                                   ELAN_PRESS_FRAMES : ELAN_MAX_FRAMES))
         {
           /* quickly stop if finger is removed */
           self->cmd_timeout = ELAN_FINGER_TIMEOUT;
@@ -590,7 +713,31 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER))
     {
-      if (self->num_frames >= ELAN_MIN_FRAMES)
+      if (ELAN_IS_PRESS (self->dev_type) && error && self->num_frames == 0)
+        {
+          /* no finger yet, the wait for finger has a timeout, keep waiting */
+          g_clear_error (&error);
+          elan_capture (self);
+          return;
+        }
+      else if (ELAN_IS_PRESS (self->dev_type))
+        {
+          if (self->num_frames >= ELAN_PRESS_MIN_FRAMES)
+            {
+              elan_submit_press_image (dev);
+            }
+          else
+            {
+              fp_dbg ("touch too short: want >= %d frames, got %d",
+                      ELAN_PRESS_MIN_FRAMES, self->num_frames);
+              fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_REMOVE_FINGER);
+            }
+          g_clear_error (&error);
+          /* do not recalibrate (next scan) while the finger is still on */
+          elan_wait_finger_off (self);
+          return;
+        }
+      else if (self->num_frames >= ELAN_MIN_FRAMES)
         {
           elan_submit_image (dev);
         }
@@ -859,7 +1006,8 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
           self->frame_height++;
           self->raw_frame_height = self->frame_height;
         }
-      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT)
+      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT &&
+          !ELAN_IS_PRESS (self->dev_type))
         self->frame_height = ELAN_MAX_FRAME_HEIGHT;
       fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
               self->raw_frame_height);
@@ -897,6 +1045,18 @@ elan_activate (FpImageDevice *dev)
                  ACTIVATE_NUM_STATES);
 
   fpi_ssm_start (ssm, activate_complete);
+}
+
+static void
+dev_probe (FpDevice *dev)
+{
+  if (ELAN_IS_PRESS (fpi_device_get_driver_data (dev)))
+    {
+      fpi_device_set_scan_type (dev, FP_SCAN_TYPE_PRESS);
+      fpi_device_set_nr_enroll_stages (dev, ELAN_PRESS_ENROLL_STAGES);
+    }
+
+  fpi_device_probe_complete (dev, NULL, NULL, NULL);
 }
 
 static void
@@ -1000,6 +1160,7 @@ fpi_device_elan_class_init (FpiDeviceElanClass *klass)
   dev_class->id_table = elan_id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   dev_class->nr_enroll_stages = 15;
+  dev_class->probe = dev_probe;
 
   img_class->img_open = dev_init;
   img_class->img_close = dev_deinit;
