@@ -66,6 +66,7 @@ struct _FpiDeviceElan
   unsigned char   frame_height;
   unsigned char   raw_frame_height;
   int             num_frames;
+  int             not_ready_retries;
   GSList         *frames;
   /* end state */
 };
@@ -86,6 +87,7 @@ elan_dev_reset_state (FpiDeviceElan *elandev)
   elandev->cmd_timeout = ELAN_CMD_TIMEOUT;
 
   elandev->calib_status = 0;
+  elandev->not_ready_retries = 0;
 
   g_free (elandev->last_read);
   elandev->last_read = NULL;
@@ -340,8 +342,12 @@ elan_submit_press_image (FpImageDevice *dev)
   qsort (sorted, frame_size, sizeof (short), cmp_short);
   lo = sorted[frame_size / 100];
   hi = sorted[frame_size - 1 - frame_size / 100];
-  if (hi <= lo)
-    hi = lo + 1;
+  if (hi - lo < ELAN_PRESS_MIN_RANGE)
+    {
+      fp_dbg ("press image too faint (levels %d..%d), retry", lo, hi);
+      fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_CENTER_FINGER);
+      return;
+    }
 
   img = fp_image_new (self->frame_width, self->frame_height);
   for (unsigned int i = 0; i < frame_size; i++)
@@ -662,6 +668,13 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
           fpi_image_device_report_finger_status (idev, TRUE);
           elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
         }
+      else if (ELAN_IS_PRESS (self->dev_type) && self->last_read &&
+               self->not_ready_retries++ < ELAN_PRESS_NOT_READY_RETRIES)
+        {
+          /* sensor not ready (seen 0x00/0xaf, like 0x0c58), wait again */
+          fp_dbg ("wait for finger returned 0x%02x, retrying", self->last_read[0]);
+          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 10);
+        }
       else if (self->dev_type == ELAN_0C58 && self->last_read &&
                (self->last_read[0] == 0x00 || self->last_read[0] == 0xaf))
         {
@@ -810,6 +823,28 @@ elan_need_calibration (FpiDeviceElan *elandev)
   return delta > ELAN_CALIBRATION_MAX_DELTA ? 1 : 0;
 }
 
+/* press sensors: is a finger resting on the sensor while we are trying to
+ * capture the background? needs the calibration mean in last_read */
+static gboolean
+elan_press_finger_on_background (FpiDeviceElan *self)
+{
+  unsigned int calib_mean = self->last_read[0] * 0xff + self->last_read[1];
+  unsigned int frame_size = self->frame_width * self->frame_height;
+  guint64 bg_mean = 0;
+
+  for (unsigned int i = 0; i < frame_size; i++)
+    bg_mean += self->background[i];
+  bg_mean /= frame_size;
+
+  if (bg_mean > calib_mean + ELAN_PRESS_FINGER_ON_BG_DELTA)
+    {
+      fp_dbg ("finger on sensor during calibration (bg mean %u, calibration mean %u), waiting",
+              (unsigned int) bg_mean, calib_mean);
+      return TRUE;
+    }
+  return FALSE;
+}
+
 enum calibrate_states {
   CALIBRATE_GET_BACKGROUND,
   CALIBRATE_SAVE_BACKGROUND,
@@ -861,7 +896,12 @@ calibrate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CALIBRATE_CHECK_NEEDED:
-      if (elan_need_calibration (self))
+      if (ELAN_IS_PRESS (self->dev_type) && elan_press_finger_on_background (self))
+        {
+          fpi_ssm_jump_to_state_delayed (ssm, CALIBRATE_GET_BACKGROUND,
+                                         ELAN_PRESS_FINGER_OFF_POLL);
+        }
+      else if (elan_need_calibration (self))
         {
           self->calib_status = 0;
           fpi_ssm_next_state (ssm);

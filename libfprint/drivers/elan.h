@@ -48,6 +48,16 @@
 /* press sensors: mean (frame - background) value above which a finger is
  * considered present; used to wait for the finger to be lifted */
 #define ELAN_PRESS_FINGER_DELTA 600
+/* press sensors: background mean this far above the calibration mean means a
+ * finger is resting on the sensor, wait for it to be lifted before
+ * calibrating */
+#define ELAN_PRESS_FINGER_ON_BG_DELTA 2000
+/* press sensors: times to retry waiting for a finger if the sensor reports
+ * it is not ready (instead of 0x55 finger present) */
+#define ELAN_PRESS_NOT_READY_RETRIES 50
+/* press sensors: minimum signal range (99th - 1st percentile above
+ * background) of a usable image; good touches give ~5000 */
+#define ELAN_PRESS_MIN_RANGE 1500
 /* press sensors: poll interval and max time to wait for the finger to lift */
 #define ELAN_PRESS_FINGER_OFF_POLL 40
 #define ELAN_PRESS_FINGER_OFF_MAX_POLLS 750
@@ -68,8 +78,10 @@
 /* times to retry reading calibration status during one session
  * generally prevents calibration from looping indefinitely */
 #define ELAN_DEFAULT_CALIBRATION_ATTEMPTS 10
+/* the Windows driver polls calibration status up to 50 times for 0903 */
 #define ELAN_CALIBRATION_ATTEMPTS(dev_type) \
-  ((dev_type) == ELAN_0C58 ? 30 : ELAN_DEFAULT_CALIBRATION_ATTEMPTS)
+  ((dev_type) == ELAN_0C58 ? 30 : \
+   (dev_type) == ELAN_0903 ? 50 : ELAN_DEFAULT_CALIBRATION_ATTEMPTS)
 
 /* min and max frames in a capture */
 #define ELAN_MIN_FRAMES 7
