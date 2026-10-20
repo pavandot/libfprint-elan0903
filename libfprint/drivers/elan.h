@@ -150,6 +150,7 @@ static const struct elan_cmd activate_cmd_1 = {
   .devices = ELAN_0907,
 };
 
+/* do not cancel reading an image half way, the 0903 re-enumerates then */
 static const struct elan_cmd get_image_cmd = {
   .cmd = {0x00, 0x09},
   /* raw frame sizes are calculated from image dimensions reported by the
@@ -157,6 +158,7 @@ static const struct elan_cmd get_image_cmd = {
   .response_len = -1,
   .response_in = ELAN_EP_IMG_IN,
   .devices = ELAN_ALL_DEV,
+  .never_cancel = TRUE,
 };
 
 static const struct elan_cmd read_sensor_status_cmd = {
