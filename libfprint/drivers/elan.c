@@ -21,6 +21,8 @@
 
 #define FP_COMPONENT "elan"
 
+#include <math.h>
+
 #include "drivers_api.h"
 #include "elan.h"
 
@@ -324,21 +326,97 @@ elan_submit_image (FpImageDevice *dev)
   fpi_image_device_image_captured (dev, img);
 }
 
+/* press sensors: rate a (background subtracted) frame by finger coverage, the
+ * percentage of blocks covered by the finger, and ridge contrast, the mean
+ * standard deviation within the covered blocks */
+static void
+elan_press_frame_quality (FpiDeviceElan *self, const unsigned short *frame,
+                          unsigned int *coverage, double *contrast)
+{
+  const unsigned int b = ELAN_PRESS_QUALITY_BLOCK;
+  unsigned int bw = self->frame_width / b, bh = self->frame_height / b;
+  unsigned int covered = 0;
+  double std_sum = 0;
+
+  for (unsigned int by = 0; by < bh; by++)
+    for (unsigned int bx = 0; bx < bw; bx++)
+      {
+        double sum = 0, sum_sq = 0, mean;
+
+        for (unsigned int y = by * b; y < (by + 1) * b; y++)
+          for (unsigned int x = bx * b; x < (bx + 1) * b; x++)
+            {
+              double px = frame[x + y * self->frame_width];
+
+              sum += px;
+              sum_sq += px * px;
+            }
+
+        mean = sum / (b * b);
+        if (mean > ELAN_PRESS_FINGER_BLOCK_MEAN)
+          {
+            covered++;
+            std_sum += sqrt (MAX (sum_sq / (b * b) - mean * mean, 0));
+          }
+      }
+
+  *coverage = covered * 100 / (bw * bh);
+  *contrast = covered ? std_sum / covered : 0;
+}
+
 /* press sensors: the whole fingertip area is in one frame, so instead of
- * assembling frames use the last (most settled) frame. Background is already
- * subtracted, map the 1st..99th percentile linearly to 0..255. */
+ * assembling frames use a single one. The first frames may catch the finger
+ * only partly on the sensor, and as the finger settles the signal saturates
+ * and the ridge contrast collapses, so use the sufficiently covered frame with
+ * the best contrast. Background is already subtracted, map the 1st..99th
+ * percentile linearly to 0..255. */
 static void
 elan_submit_press_image (FpImageDevice *dev)
 {
   FpiDeviceElan *self = FPI_DEVICE_ELAN (dev);
   unsigned int frame_size = self->frame_width * self->frame_height;
-  unsigned short *frame = self->frames->data;
-  g_autofree unsigned short *sorted = g_memdup2 (frame, frame_size * sizeof (short));
+  unsigned short *frame = NULL;
+  g_autofree unsigned short *sorted = NULL;
   FpImage *img;
   unsigned short lo, hi;
+  unsigned int min_coverage, max_coverage = 0, best_coverage = 0;
+  unsigned int n = 0, best = 0;
+  double best_contrast = -1;
 
   G_DEBUG_HERE ();
 
+  min_coverage =
+    fpi_device_get_current_action (FP_DEVICE (dev)) == FPI_DEVICE_ACTION_ENROLL ?
+    ELAN_PRESS_MIN_COVERAGE_ENROLL : ELAN_PRESS_MIN_COVERAGE_VERIFY;
+
+  /* frames are stored newest first */
+  for (GSList *l = self->frames; l; l = l->next, n++)
+    {
+      unsigned int coverage;
+      double contrast;
+
+      elan_press_frame_quality (self, l->data, &coverage, &contrast);
+      fp_dbg ("frame %u: coverage %u%%, contrast %.0f",
+              self->num_frames - n, coverage, contrast);
+      max_coverage = MAX (max_coverage, coverage);
+      if (coverage >= min_coverage && contrast > best_contrast)
+        {
+          frame = l->data;
+          best = self->num_frames - n;
+          best_coverage = coverage;
+          best_contrast = contrast;
+        }
+    }
+
+  if (!frame)
+    {
+      fp_dbg ("finger coverage too low (%u%%, need %u%%), retry",
+              max_coverage, min_coverage);
+      fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_CENTER_FINGER);
+      return;
+    }
+
+  sorted = g_memdup2 (frame, frame_size * sizeof (short));
   qsort (sorted, frame_size, sizeof (short), cmp_short);
   lo = sorted[frame_size / 100];
   hi = sorted[frame_size - 1 - frame_size / 100];
@@ -358,7 +436,8 @@ elan_submit_press_image (FpImageDevice *dev)
       img->data[i] = (px - lo) * 255 / (hi - lo);
     }
 
-  fp_dbg ("press image from frame %d, levels %d..%d", self->num_frames, lo, hi);
+  fp_dbg ("press image from frame %u of %d (coverage %u%%, contrast %.0f), levels %d..%d",
+          best, self->num_frames, best_coverage, best_contrast, lo, hi);
 
   /* native resolution, sigfm works on the ~500dpi 80x80 image as is */
   img->flags |= FPI_IMAGE_PARTIAL;

@@ -41,8 +41,17 @@
 #define ELAN_IS_PRESS(dev_type) (((dev_type) & ELAN_PRESS_DEV) != 0)
 
 /* press sensors: number of frames to read after the finger is detected, the
- * last one is used. The finger pressure settles after ~250ms */
+ * best one is used (see ELAN_PRESS_QUALITY_BLOCK). The finger pressure
+ * settles after ~250ms */
 #define ELAN_PRESS_FRAMES 10
+/* press sensors: frame quality. A block is covered by the finger if its mean
+ * (background subtracted) value exceeds ELAN_PRESS_FINGER_BLOCK_MEAN. A frame
+ * needs this percentage of covered blocks to be used, like the area thresholds
+ * (Area_Threshold_ENRO/IDEN) of the Windows driver */
+#define ELAN_PRESS_QUALITY_BLOCK 8
+#define ELAN_PRESS_FINGER_BLOCK_MEAN 2500
+#define ELAN_PRESS_MIN_COVERAGE_ENROLL 75
+#define ELAN_PRESS_MIN_COVERAGE_VERIFY 70
 /* press sensors: minimum frames if the finger is lifted early */
 #define ELAN_PRESS_MIN_FRAMES 4
 /* press sensors: mean (frame - background) value above which a finger is
